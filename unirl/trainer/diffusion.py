@@ -190,9 +190,7 @@ class DiffusionTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     # Colocated handlers (tensor/ipc) take the engine as a local sibling.
                     sync_extra = self._resolve_sync_lora_adapter(backend_cfg, sync_cfg)
-                    self.weight_sync = remote_hydra(
-                        sync_cfg, backend=self.backend, rollout=self.rollout, **sync_extra
-                    )
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout, **sync_extra)
 
     def _build_train_side(
         self,
