@@ -3,7 +3,7 @@ import inspect
 import logging
 import os
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from hydra.utils import get_class, instantiate
@@ -64,6 +64,15 @@ class DiffusionTrainer(BaseTrainer):
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
         # default → unchanged per-group GRPO normalization for every other recipe.
         self._adv_use_global_std = bool(adv_use_global_std)
+        # WandB rollout media (generated images/videos): read from the optional
+        # ``logging`` block. ``log_media`` gates it; ``media_log_interval`` throttles
+        # it (every N rollouts); ``media_max_items`` caps samples per panel. Logged
+        # from the rollout's ``decoded`` payload before it is dropped (see train_step).
+        self._log_media = bool(logging_cfg.get("log_media", False)) if logging_cfg is not None else False
+        self._media_max_items = int(logging_cfg.get("media_max_items", 8)) if logging_cfg is not None else 8
+        self._media_log_interval = (
+            max(1, int(logging_cfg.get("media_log_interval", 1))) if logging_cfg is not None else 1
+        )
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
@@ -291,6 +300,39 @@ class DiffusionTrainer(BaseTrainer):
             init_noise_latent_shape=init_noise_latent_shape,
         )
 
+    def _maybe_log_media(self, rollout_id: int, req: RolloutReq, resp: Any) -> None:
+        """Log generated rollout media (images/videos) to wandb.
+
+        No-op unless ``logging.log_media`` is set and this rollout falls on the
+        ``media_log_interval`` cadence. Must be called AFTER scoring (rewards
+        drive the captions) and BEFORE :meth:`_drop_decoded` nulls the generated
+        payload.
+
+        ``track.decoded`` arrives at the driver with its tensor leaves dehydrated
+        to ``TensorMeta`` proxies (``Worker.call`` packs every returned tensor),
+        so we hydrate them back to real ``Images`` / ``Videos`` before building
+        the preview. ``build_media_preview_for_track`` returns ``None`` for a
+        track without materialized media, so this stays safe across topologies.
+        Hydration pulls the full decoded batch to the driver, so keep
+        ``media_log_interval`` modest (not every rollout) on large batches."""
+        if not self._log_media or (rollout_id % self._media_log_interval != 0):
+            return
+        wb = self.wandb_logger
+        if wb is None or not wb.initialized:
+            return
+        from unirl.distributed.tensor.transport import map_tree
+        from unirl.types.media_preview import build_media_preview_for_track
+        from unirl.types.rollout_resp import _hydrate_tensor_meta
+
+        for track in resp.tracks.values():
+            if track.decoded is None:
+                continue
+            track.decoded = map_tree(track.decoded, _hydrate_tensor_meta)
+            media = build_media_preview_for_track(req=req, track=track, max_items=self._media_max_items)
+            if media is not None:
+                wb.log_generated_media(rollout_id, media)
+                break  # single-track for now; revisit if multi-track lands
+
     def train_step(
         self,
         req: RolloutReq,
@@ -362,6 +404,8 @@ class DiffusionTrainer(BaseTrainer):
             if track.rewards is not None:
                 resp.tracks[name] = track.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
 
+        # Log generated media (images/videos) to wandb BEFORE decoded is dropped.
+        self._maybe_log_media(rollout_id, req, resp)
         self._drop_decoded(resp)
         (track,) = resp.tracks.values()
         result = self.stack.train_track(track, training_progress=float(training_progress))
