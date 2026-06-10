@@ -10,6 +10,7 @@ from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.train.configs import EmaLoraConfig
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
@@ -172,17 +173,15 @@ class DiffusionTrainer(BaseTrainer):
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-    def _resolve_sync_lora_adapter(self, backend_cfg: DictConfig, sync_cfg: DictConfig) -> dict:
-        """Auto-wire the weight sync to push the EMA shadow adapter for DiffusionNFT.
+    def _resolve_sync_lora_adapter(self, backend_cfg: DictConfig, sync_cfg: DictConfig) -> dict[str, str]:
+        """Auto-wire the weight sync to push DiffusionNFT's EMA ``shadow_adapter``.
 
-        DiffusionNFT (``requires_ema_rollout`` → ``self._uses_ema``) must roll out
-        under the EMA-smoothed ``"old"`` shadow adapter. In SEPARATE mode the
-        in-process ``apply_eval_ema`` swap never reaches the rollout engine, so the
-        sync itself must fold the shadow (not the trainable ``"default"``) into the
-        pushed base. Returns ``{"lora_adapter": <shadow>}`` to inject, or ``{}`` when:
-        - the algorithm isn't EMA-based (GRPO),
-        - the backend has no ``ema_lora_cfg`` (no shadow adapter installed), or
-        - the recipe already pinned ``sync.lora_adapter`` (explicit override wins).
+        DiffusionNFT must roll out under its EMA shadow; in SEPARATE mode the
+        in-process swap never reaches the engine, so the sync folds the shadow
+        into the pushed base (see ``FullWeightSync.lora_adapter``). Returns
+        ``{"lora_adapter": <shadow>}`` to inject, or ``{}`` when the algorithm is
+        not EMA-based, the backend has no ``ema_lora_cfg``, or the recipe already
+        pinned ``sync.lora_adapter`` (explicit override wins).
         """
         if not self._uses_ema:
             return {}
@@ -191,7 +190,7 @@ class DiffusionTrainer(BaseTrainer):
         ema_lora_cfg = backend_cfg.get("ema_lora_cfg")
         if ema_lora_cfg is None:
             return {}
-        shadow_adapter = str(ema_lora_cfg.get("shadow_adapter", "old"))
+        shadow_adapter = str(ema_lora_cfg.get("shadow_adapter", EmaLoraConfig.shadow_adapter))
         return {"lora_adapter": shadow_adapter}
 
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
