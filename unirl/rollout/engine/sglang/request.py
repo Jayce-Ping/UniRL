@@ -235,7 +235,11 @@ def _to_sglang_kwargs(
 
     # Layer 4: SDE-kernel kwargs only apply when the algorithm requested
     # per-step SDE noise (GRPO). ODE/non-SDE mode (eval, DiffusionNFT) omits them.
-    if sde_indices is not None:
+    # An EMPTY list is ODE mode too: ``num_sde_steps=0`` resolves to ``[]`` (not
+    # ``None``) via ``resolve_sde_indices``, so gate on non-emptiness — otherwise
+    # the SDE kwargs (incl. ``rollout_sde_step_indices``) leak into the engine's
+    # SamplingParams and DiffusionNFT crashes its sglang rollout.
+    if sde_indices:
         require(
             sde_label is not None,
             "_to_sglang_kwargs: SDE mode requires sde_label (resolved by engine ctor)",
