@@ -113,10 +113,7 @@ class FullWeightSync(Remote):
         self._bucket_bytes = int(bucket_size_mb) * 1024 * 1024
         self._flush_cache = bool(flush_cache)
         self._lora_merged = bool(lora_merged)
-        # Which PEFT adapter's delta to read (default = trainable adapter). A
-        # non-default adapter (e.g. DiffusionNFT's EMA ``"old"`` shadow) must be
-        # merged into the base before the push — a full-weight receiver applies
-        # no separately-shipped adapter delta — so fail closed when it isn't.
+        # See class docstring: a non-default adapter must be merged in, so fail closed.
         self._lora_adapter = str(lora_adapter or "default")
         if self._lora_adapter != "default" and not self._lora_merged:
             raise ValueError(

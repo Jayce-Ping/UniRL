@@ -2,13 +2,11 @@
 # SD3.5 + DiffusionNFT, v2 trainer — SGLang SEPARATE-mode variant.
 #
 # DiffusionNFT rolls out under the EMA-smoothed "old" adapter
-# (requires_ema_rollout=True). In SEPARATE mode the rollout runs in a distinct
-# SGLang process, so the trainer's in-process EMA swap (backend.apply_eval_ema)
-# does NOT reach the engine; instead the weight sync below folds the EMA "old"
-# shadow adapter into the pushed base weights. The trainer auto-wires this from
-# ema_lora_cfg.shadow_adapter (DiffusionTrainer._resolve_sync_lora_adapter), so
-# the SGLang engine samples under the EMA-smoothed weights — faithful to v1.
-# (Override with sync.lora_adapter if you ever need a different adapter.)
+# (requires_ema_rollout=True). In SEPARATE mode the in-process EMA swap cannot
+# reach the SGLang engine, so the weight sync folds the EMA shadow adapter into
+# the pushed base instead. The trainer auto-wires this from
+# ema_lora_cfg.shadow_adapter, so the engine samples under the EMA weights —
+# faithful to v1. (Override with sync.lora_adapter for a different adapter.)
 
 num_devices: 16               # 2 nodes x 8 GPUs (v1: 4 train + 4 rollout / node)
 
@@ -69,9 +67,8 @@ backend:
     type: constant
     warmup_steps: 0
     total_steps: 10000
-  # DiffusionNFT dual-adapter EMA. The weight sync folds the "old" shadow
-  # (shadow_adapter below) into the pushed base, so SGLang rollout uses the EMA
-  # weights (auto-wired by the trainer; see header).
+  # DiffusionNFT dual-adapter EMA; shadow_adapter is auto-wired into the sync
+  # so SGLang rollout uses the EMA weights (see header).
   ema_lora_cfg:
     _target_: unirl.train.configs.EmaLoraConfig
     rank: 32
@@ -176,10 +173,8 @@ sampling:
     num_sde_steps: 0
 
 # Merged full-weight sync → SGLang rollout (separate-slab NCCL broadcast).
-# Folds the EMA "old" shadow adapter into the pushed base (lora_adapter is
-# auto-wired to ema_lora_cfg.shadow_adapter by the trainer); lora_merged: true
-# is required for the shadow path (a full-weight receiver applies no separate
-# adapter delta).
+# Folds the EMA shadow adapter into the pushed base (see header); lora_merged:
+# true is required for the shadow path.
 sync:
   _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
   lora_merged: true
