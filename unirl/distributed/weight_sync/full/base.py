@@ -68,6 +68,16 @@ class FullWeightSync(Remote):
     LoRA deltas into the base weights and pushes the merged full model
     (meaningful for a LoRA run served without a separate adapter).
 
+    ``lora_adapter`` names which PEFT adapter's delta is read from the train
+    model (default ``"default"`` — the trainable adapter). DiffusionNFT installs
+    a second EMA-tracked ``"old"`` shadow adapter and must roll out under it
+    (``requires_ema_rollout``); pointing the sync at ``"old"`` is what carries
+    the EMA-smoothed weights into a SEPARATE rollout engine, where the in-process
+    ``apply_eval_ema`` adapter swap cannot reach. A non-default adapter REQUIRES
+    ``lora_merged=True``: a full-weight receiver loads merged base weights and
+    does not apply a separately-shipped adapter delta, so the shadow must be
+    folded in before the push (the ctor fails closed otherwise).
+
     ``track_prefix`` routes the push to one child of a ``ComposedRolloutEngine``
     (e.g. ``"ar"`` / ``"diffusion"``); empty (default) targets a single-model
     engine. Each transport forwards it to the rollout so the receiver demuxes.
@@ -89,6 +99,7 @@ class FullWeightSync(Remote):
         bucket_size_mb: int = 512,
         flush_cache: bool = True,
         lora_merged: bool = False,
+        lora_adapter: str = "default",
         name_remap: Optional[Dict[str, Optional[str]]] = None,
         track_prefix: str = "",
         wire_dtype: Any = None,
@@ -102,6 +113,17 @@ class FullWeightSync(Remote):
         self._bucket_bytes = int(bucket_size_mb) * 1024 * 1024
         self._flush_cache = bool(flush_cache)
         self._lora_merged = bool(lora_merged)
+        # Which PEFT adapter's delta to read (default = trainable adapter). A
+        # non-default adapter (e.g. DiffusionNFT's EMA ``"old"`` shadow) must be
+        # merged into the base before the push — a full-weight receiver applies
+        # no separately-shipped adapter delta — so fail closed when it isn't.
+        self._lora_adapter = str(lora_adapter or "default")
+        if self._lora_adapter != "default" and not self._lora_merged:
+            raise ValueError(
+                f"FullWeightSync: lora_adapter={self._lora_adapter!r} requires "
+                f"lora_merged=True (a non-default adapter must be folded into the "
+                f"pushed base weights; got lora_merged=False)."
+            )
         # Ordered, first-match-wins name rewrites (glob -> replacement, or None to
         # drop); see _validate_name_remap / _apply_name_remap for the contract.
         self._name_remap = _validate_name_remap(name_remap)
@@ -131,6 +153,10 @@ class FullWeightSync(Remote):
           - ``False`` → ``raw_state_dict`` base weights, skipping
             ``.lora_A``/``.lora_B``.
 
+        ``lora_adapter`` (default ``"default"``) names which adapter's delta the
+        walk reads — DiffusionNFT points it at the EMA ``"old"`` shadow so the
+        rollout engine receives the EMA-smoothed weights.
+
         Each emitted name is then rewritten by ``name_remap`` (see
         ``_apply_name_remap``): a ``None`` rule drops the param (e.g. a frozen
         tower not in the receiver), and the ``"*"`` catch-all nests the trained
@@ -145,13 +171,17 @@ class FullWeightSync(Remote):
 
         remap = self._name_remap
         if self._lora_merged:
-            for name, tensor in merged_state_dict(self._backend.model, dtype=self._wire_dtype):
+            for name, tensor in merged_state_dict(
+                self._backend.model, adapter_name=self._lora_adapter, dtype=self._wire_dtype
+            ):
                 out = _apply_name_remap(name, remap)
                 if out is not None:
                     yield out, tensor
             return
 
-        for name, tensor in raw_state_dict(self._backend.model, dtype=self._wire_dtype):
+        for name, tensor in raw_state_dict(
+            self._backend.model, adapter_name=self._lora_adapter, dtype=self._wire_dtype
+        ):
             if name.endswith(".lora_A") or name.endswith(".lora_B"):
                 continue
             out = _apply_name_remap(name, remap)

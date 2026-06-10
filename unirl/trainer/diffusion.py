@@ -173,7 +173,8 @@ class DiffusionTrainer(BaseTrainer):
                 self._build_train_side(**train_cfgs)
                 if sync_cfg is not None:
                     # NCCL handler: rollout is cross-slab, wired via the handshake below.
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+                    sync_extra = self._resolve_sync_lora_adapter(backend_cfg, sync_cfg)
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, **sync_extra)
             # Rollout slab = the rest. Top-level ``fraction`` is relative to the
             # WHOLE pool (placement.py), so the remainder is ``1 - train_fraction``.
             with placement(self.pool, fraction=1.0 - train_fraction, shared_workers=True):
@@ -187,7 +188,10 @@ class DiffusionTrainer(BaseTrainer):
                 self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
                 if sync_cfg is not None:
                     # Colocated handlers (tensor/ipc) take the engine as a local sibling.
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+                    sync_extra = self._resolve_sync_lora_adapter(backend_cfg, sync_cfg)
+                    self.weight_sync = remote_hydra(
+                        sync_cfg, backend=self.backend, rollout=self.rollout, **sync_extra
+                    )
 
     def _build_train_side(
         self,
@@ -220,6 +224,28 @@ class DiffusionTrainer(BaseTrainer):
         algo_extra = {"backend": self.backend} if self._uses_ema else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
+
+    def _resolve_sync_lora_adapter(self, backend_cfg: DictConfig, sync_cfg: DictConfig) -> dict:
+        """Auto-wire the weight sync to push the EMA shadow adapter for DiffusionNFT.
+
+        DiffusionNFT (``requires_ema_rollout`` → ``self._uses_ema``) must roll out
+        under the EMA-smoothed ``"old"`` shadow adapter. In SEPARATE mode the
+        in-process ``apply_eval_ema`` swap never reaches the rollout engine, so the
+        sync itself must fold the shadow (not the trainable ``"default"``) into the
+        pushed base. Returns ``{"lora_adapter": <shadow>}`` to inject, or ``{}`` when:
+        - the algorithm isn't EMA-based (GRPO),
+        - the backend has no ``ema_lora_cfg`` (no shadow adapter installed), or
+        - the recipe already pinned ``sync.lora_adapter`` (explicit override wins).
+        """
+        if not self._uses_ema:
+            return {}
+        if sync_cfg.get("lora_adapter") is not None:
+            return {}
+        ema_lora_cfg = backend_cfg.get("ema_lora_cfg")
+        if ema_lora_cfg is None:
+            return {}
+        shadow_adapter = str(ema_lora_cfg.get("shadow_adapter", "old"))
+        return {"lora_adapter": shadow_adapter}
 
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
         """Build the rollout remote in the currently active placement scope.
