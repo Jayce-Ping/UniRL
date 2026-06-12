@@ -10,6 +10,8 @@ ratio-clip math.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Mapping, Optional, Type
@@ -30,6 +32,8 @@ from .base import (
     typed_conditions,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class FlowGRPOConfig(BaseAlgorithmConfig):
@@ -38,6 +42,10 @@ class FlowGRPOConfig(BaseAlgorithmConfig):
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
     old_logp_source: str = "rollout"
+    # Debug-only: fire the one-shot native-vs-replay ratio probe (also honored
+    # via UNIRL_DEBUG_RATIO env). Config knob is the robust trigger because it
+    # serializes to every Ray worker; the env var only reaches local ray.init().
+    debug_ratio: bool = False
     params: Any = dc_field(default=None)
 
 
@@ -84,6 +92,7 @@ class FlowGRPO(StageAlgorithm):
         clip_range: float = 1e-4,
         clip_schedule: str = "constant",
         old_logp_source: str = "rollout",
+        debug_ratio: bool = False,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         super().__init__()
@@ -101,6 +110,11 @@ class FlowGRPO(StageAlgorithm):
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
         self.conditions_cls = conditions_cls
+        # One-shot native-vs-replay probe gate: enabled by either the config
+        # knob (robust — serializes to Ray workers) or UNIRL_DEBUG_RATIO env
+        # (convenient for local ray.init()). Fires once (first on-policy micro).
+        self._debug_ratio_enabled = bool(debug_ratio) or bool(os.environ.get("UNIRL_DEBUG_RATIO"))
+        self._debug_ratio_done = False
 
     def prepare_segment(
         self,
@@ -155,6 +169,24 @@ class FlowGRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
+
+        # One-shot trainside train/rollout consistency probe (UNIRL_DEBUG_RATIO).
+        # Runs on the first micro of the first (on-policy) update — pre-update
+        # weights — comparing the rollout-emitted native sde_logp against replay
+        # under (eval,no_grad)/(train,no_grad)/(train,grad) to attribute the gap.
+        if self._debug_ratio_enabled and not self._debug_ratio_done:
+            self._debug_ratio_done = True
+            from unirl.algorithms._debug_ratio import run_trainside_ratio_probe
+
+            run_trainside_ratio_probe(
+                stage=self.stage,
+                conditions=typed_conds,
+                segment=segment,
+                params=self.params,
+                target_steps=target_steps,
+                old_logp_source=self.old_logp_source,
+                logger=logger,
+            )
 
         replay_result = self.stage.replay(
             typed_conds,
