@@ -19,10 +19,13 @@ methods so the driver can import this module to reference the class for
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from unirl.config.require import require
 from unirl.distributed.group.remote import Remote
+
+logger = logging.getLogger(__name__)
 
 
 def _one_star(s: object) -> bool:
@@ -122,6 +125,17 @@ class FullWeightSync(Remote):
                 f"FullWeightSync: adapter_name={self._adapter_name!r} requires "
                 f"lora_merged=True (a non-default adapter must be folded into the "
                 f"pushed base weights; got lora_merged=False)."
+            )
+        # The pushed adapter is invisible in the recipe when it defaults from the
+        # backend (DiffusionNFT resolves to the EMA shadow "old"), so log it once:
+        # a SEPARATE rollout engine sampling under "old" is the intended faithful
+        # path, not a misconfiguration.
+        if self._adapter_name != "default":
+            logger.info(
+                "%s: rollout engine will be synced from adapter %r (%s).",
+                type(self).__name__,
+                self._adapter_name,
+                "explicit adapter_name" if adapter_name is not None else "backend.rollout_adapter_name",
             )
         # Ordered, first-match-wins name rewrites (glob -> replacement, or None to
         # drop); see _validate_name_remap / _apply_name_remap for the contract.
