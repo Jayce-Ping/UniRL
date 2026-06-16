@@ -74,6 +74,13 @@ class PETrainer(BaseTrainer):
     :class:`PEPipeline` samples its live module under ``torch.no_grad``), but it
     has no backend / algorithm / stack and never trains — only the diffusion
     track updates. Use it to learn diffusion against a fixed prompt-enhancer.
+
+    ``diffusion_group_scope`` selects the diffusion track's GRPO grouping (the
+    advantage baseline): ``"rewrite"`` (default) compares the M images of one
+    rewrite; ``"prompt"`` compares all N*M images of one original prompt across
+    every rewrite, so diffusion learns to render well for the original intent
+    regardless of how the (frozen) rewriter phrased it. The objective recipe
+    pairs ``freeze_llm=True`` with ``diffusion_group_scope="prompt"``.
     """
 
     def __init__(
@@ -91,6 +98,7 @@ class PETrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = False,
         freeze_llm: bool = False,
+        diffusion_group_scope: str = "rewrite",
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -106,6 +114,22 @@ class PETrainer(BaseTrainer):
         # ``stack.train_track``; with a frozen LLM that's diffusion alone.
         self._freeze_llm = bool(freeze_llm)
         self._train_tracks: Tuple[str, ...] = ("diffusion",) if self._freeze_llm else TRACK_NAMES
+        # Diffusion-track GRPO grouping level (the advantage baseline):
+        #   "rewrite" (default): group = the M images of one rewrite (group by
+        #       the rewrite's sample id) — images compared only to siblings with
+        #       identical conditioning text. Byte-identical to the prior behavior.
+        #   "prompt": group = all N*M images descended from one original prompt
+        #       (group by the ROOT prompt id) — a rewrite that systematically
+        #       beats the prompt-wide mean earns non-zero advantage, so diffusion
+        #       learns to render well for the original intent across the rewriter's
+        #       rephrasings. Pairs with ``freeze_llm`` (fixed rewriter) for the
+        #       "same semantics, different wordings → better images" objective.
+        self._diffusion_group_scope = str(diffusion_group_scope)
+        if self._diffusion_group_scope not in ("rewrite", "prompt"):
+            raise ValueError(
+                f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; "
+                f"got {diffusion_group_scope!r}."
+            )
 
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
@@ -284,11 +308,16 @@ class PETrainer(BaseTrainer):
         if di_rewards is not None:
             mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
-        # 4. Per-track GRPO advantages — "ar" groups by prompt (N rewrites),
-        #    "diffusion" groups by rewrite (M images). Only the trained tracks
-        #    need advantages; a frozen LLM skips the AR advantage entirely.
+        # 4. Per-track GRPO advantages. "ar" groups by prompt (its N rewrites).
+        #    "diffusion" groups by rewrite (M images) by default, or — when
+        #    ``diffusion_group_scope="prompt"`` — by the ROOT prompt (all N*M
+        #    images of a prompt) so cross-rewrite quality becomes signal. Only
+        #    the trained tracks need advantages; a frozen LLM skips the AR one.
         for name in self._train_tracks:
-            resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
+            if name == "diffusion" and self._diffusion_group_scope == "prompt":
+                resp.tracks[name] = resp.compute_track_advantages(name, group_key="root", normalize=True)
+            else:
+                resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
 
         # ``reward_req`` text is repeat_interleaved to the diffusion track size
         # (one prompt per sample), so it captions the image previews correctly —

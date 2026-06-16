@@ -12,6 +12,12 @@
 # ONLY `bundle` + `pipeline` (the rollout sampler); its `backend` / `algorithm`
 # / `stack` blocks are omitted — PETrainer._wire_rollout_only_side ignores them.
 #
+# `diffusion_group_scope: prompt` is the OBJECTIVE pairing: the diffusion GRPO
+# group is all N*M images of one ORIGINAL prompt (across every rewrite), so the
+# advantage rewards rendering well for the original intent regardless of how the
+# frozen rewriter phrased it — "same semantics, different wordings → better
+# images". (Default 'rewrite' would only compare the M images of one rewrite.)
+#
 # Pairs with unirl/train_pe.py (PETrainer). Geometry:
 # P=8 prompts × N=4 rewrites × M=4 images = 128 diffusion / 32 ar samples per rollout.
 
@@ -20,6 +26,8 @@ batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*
 
 # Frozen LLM: AR side is a rollout-only rewriter (no AR training).
 freeze_llm: true
+# Diffusion GRPO group = all N*M images of one original prompt (see header).
+diffusion_group_scope: prompt
 
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
