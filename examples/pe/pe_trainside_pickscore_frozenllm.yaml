@@ -176,6 +176,15 @@ sampling:
     autocast_precision: bf16
     trajectory_precision: bf16
     logprob_precision: fp32
-    sde_indices: [1]
+    # SDE step schedule: one randomly-chosen denoising step per rollout runs the
+    # SDE (eta-noise + log-prob); all others are deterministic. num_sde_steps=1
+    # picks a single step, seeded by rollout_id (PETrainer._build_req resolves it
+    # per rollout). timestep_fraction [0, 0.9] = pool range(0, int(10*0.9))=0..8,
+    # so the LAST step (index 9) is excluded.
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      num_sde_steps: 1
+      timestep_fraction: [0, 0.9]
 
 num_rollouts: 300
