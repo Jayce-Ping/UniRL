@@ -12,14 +12,22 @@
 # ONLY `bundle` + `pipeline` (the rollout sampler); its `backend` / `algorithm`
 # / `stack` blocks are omitted — PETrainer._wire_rollout_only_side ignores them.
 #
+# `diffusion_group_scope: prompt` is the OBJECTIVE pairing: the diffusion GRPO
+# group is all N*M images of one ORIGINAL prompt (across every rewrite), so the
+# advantage rewards rendering well for the original intent regardless of how the
+# frozen rewriter phrased it — "same semantics, different wordings → better
+# images". (Default 'rewrite' would only compare the M images of one rewrite.)
+#
 # Pairs with unirl/train_pe.py (PETrainer). Geometry:
-# P=8 prompts × N=4 rewrites × M=4 images = 128 diffusion / 32 ar samples per rollout.
+# P=8 prompts × N=4 rewrites × M=8 images = 256 diffusion / 32 ar samples per rollout.
 
 num_devices: 8
 batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*N*M
 
 # Frozen LLM: AR side is a rollout-only rewriter (no AR training).
 freeze_llm: true
+# Diffusion GRPO group = all N*M images of one original prompt (see header).
+diffusion_group_scope: prompt
 
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
@@ -161,11 +169,11 @@ sampling:
     _target_: unirl.types.sampling.ARSamplingParams
     samples_per_prompt: 4       # N rewrites per prompt
     temperature: 0.7
-    max_new_tokens: 256
+    max_new_tokens: 512
     top_p: 0.9
   diffusion:
     _target_: unirl.types.sampling.DiffusionSamplingParams
-    samples_per_prompt: 4       # M images per rewrite
+    samples_per_prompt: 8       # M images per rewrite
     num_inference_steps: 10
     guidance_scale: 1.0
     height: 512
@@ -180,7 +188,8 @@ sampling:
     # SDE (eta-noise + log-prob); all others are deterministic. num_sde_steps=1
     # picks a single step, seeded by rollout_id (PETrainer._build_req resolves it
     # per rollout). timestep_fraction [0, 0.9] = pool range(0, int(10*0.9))=0..8,
-    # so the LAST step (index 9) is excluded.
+    # so the LAST step (index 9) is excluded. Replaces the prior sde_indices:[0..9]
+    # which made EVERY step inject noise (over-randomized → smeared images).
     scheduler:
       _target_: unirl.utils.scheduler_utils.AllSDEScheduler
       num_timesteps: ${..num_inference_steps}
