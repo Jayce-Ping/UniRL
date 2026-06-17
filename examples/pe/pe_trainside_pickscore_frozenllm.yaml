@@ -13,7 +13,7 @@
 # / `stack` blocks are omitted — PETrainer._wire_rollout_only_side ignores them.
 #
 # Pairs with unirl/train_pe.py (PETrainer). Geometry:
-# P=8 prompts × N=4 rewrites × M=8 images = 256 diffusion / 32 ar samples per rollout.
+# P=8 prompts × N=4 rewrites × M=4 images = 128 diffusion / 32 ar samples per rollout.
 
 num_devices: 8
 batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*N*M
@@ -161,11 +161,11 @@ sampling:
     _target_: unirl.types.sampling.ARSamplingParams
     samples_per_prompt: 4       # N rewrites per prompt
     temperature: 0.7
-    max_new_tokens: 512
+    max_new_tokens: 256
     top_p: 0.9
   diffusion:
     _target_: unirl.types.sampling.DiffusionSamplingParams
-    samples_per_prompt: 8       # M images per rewrite
+    samples_per_prompt: 4       # M images per rewrite
     num_inference_steps: 10
     guidance_scale: 1.0
     height: 512
@@ -176,6 +176,6 @@ sampling:
     autocast_precision: bf16
     trajectory_precision: bf16
     logprob_precision: fp32
-    sde_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    sde_indices: [1]
 
 num_rollouts: 300
