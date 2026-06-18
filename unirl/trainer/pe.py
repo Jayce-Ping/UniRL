@@ -127,8 +127,7 @@ class PETrainer(BaseTrainer):
         self._diffusion_group_scope = str(diffusion_group_scope)
         if self._diffusion_group_scope not in ("rewrite", "prompt"):
             raise ValueError(
-                f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; "
-                f"got {diffusion_group_scope!r}."
+                f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
             )
 
         # Driver-side data iterator (not a Remote).
