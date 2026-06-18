@@ -27,6 +27,7 @@ diffusion sub-request unchanged.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from unirl.models.types.pipeline import Pipeline
@@ -37,6 +38,8 @@ from unirl.types.sampling import get_ar_params, get_diffusion_params
 
 from .bundle import PEBundle
 from .instruction import postprocess_pe_texts
+
+logger = logging.getLogger(__name__)
 
 
 class PEPipeline(Pipeline):
@@ -208,13 +211,22 @@ class PEPipeline(Pipeline):
         # the P original prompts; slot k of the P*N rewrites maps to prompt
         # ``k // n_rewrites``.
         if self.pe_marker:
-            cleaned_texts, _stats = postprocess_pe_texts(
+            cleaned_texts, stats = postprocess_pe_texts(
                 rewritten.texts,
                 user_prompts=texts.texts,
                 samples_per_prompt=n_rewrites,
                 marker=self.pe_marker,
                 max_chars=self.pe_max_chars,
             )
+            if any(stats.values()):
+                logger.info(
+                    "PEPipeline: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
+                    self.pe_marker,
+                    stats["empty"],
+                    len(rewritten.texts),
+                    stats["truncated"],
+                    stats["fallback"],
+                )
             rewritten = Texts(texts=cleaned_texts)
             ar_track = _track_with_field(ar_track, "decoded", rewritten)
 
@@ -266,13 +278,15 @@ class PEPipeline(Pipeline):
 
         Forwards the parent's ``stage_config["chat"]`` and, when
         ``self.pe_instruction`` is set, injects it as the chat
-        ``system_instruction`` so the rewriter enhances the prompt — mirroring
-        ComposedRolloutEngine (composed/engine.py). An explicit per-request
-        ``system_instruction`` already on ``stage_config["chat"]`` wins.
+        ``system_instruction`` (overwriting any inherited value) so the
+        rewriter enhances the prompt — matching ComposedRolloutEngine
+        (composed/engine.py), which likewise forces ``pe_instruction`` onto the
+        AR/chat ``system_instruction`` so generation always uses the recipe's
+        PE prompt.
         """
         chat_cfg = dict(req.stage_config.get("chat") or {})
         if self.pe_instruction:
-            chat_cfg.setdefault("system_instruction", self.pe_instruction)
+            chat_cfg["system_instruction"] = self.pe_instruction
         stage_config = {"chat": chat_cfg} if chat_cfg else {}
         return RolloutReq(
             sample_ids=list(sample_ids),
