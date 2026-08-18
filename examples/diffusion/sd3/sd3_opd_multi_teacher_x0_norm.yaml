@@ -1,9 +1,15 @@
 # @package _global_
-# DiffusionOPD — multi-teacher on-policy distillation for SD3.5-Medium (MOPD).
+# DiffusionOPD — multi-teacher on-policy distillation for SD3.5-Medium (MOPD),
+# x0 + self-normalize variant of sd3_opd_multi_teacher.yaml.
 #
-# Distills 3 task-specific teacher LoRA adapters (PickScore aesthetics / OCR /
-# GenEval compositionality) into one student via closed-form per-step KL
-# matching on the student's own rollout trajectories (arXiv 2605.15055).
+# Same teachers / data / frozen adapters as the default xt KL recipe; only the
+# distillation space changes:
+#   loss_target: x0          -> match x0 = x_t - σ v (σ from segment.sigmas)
+#   self_normalize: true     -> per-sample-step MSE / detached MAE
+#   add_kl_coefficient: false (required for v/x0)
+#
+# Launch (1 node x 8 GPUs; start the geneval service first or swap that scorer out):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_multi_teacher_x0_norm
 #
 # Wiring overview (each piece is independently reusable):
 #   - backend.lora_cfg.frozen_adapters   -> teachers injected pre-FSDP-wrap, frozen
@@ -17,9 +23,6 @@
 # OUT-OF-PROCESS in unirl-reward-service (configs/geneval_service.yaml) on a
 # sidecar node/env; this recipe reaches it over HTTP via REWARD_SERVICE_URL.
 # PickScore and OCR stay local.
-#
-# Launch (1 node x 8 GPUs; start the geneval service first or swap that scorer out):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_multi_teacher
 
 num_devices: 8
 batch_size: 8
@@ -40,7 +43,7 @@ logging:
   project_name: ${oc.env:WANDB_PROJECT,unirl-sd3-opd}
   run_name: null
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [sd3, opd, distillation, multi-teacher]
+  tags: [sd3, opd, distillation, multi-teacher, x0, self-normalize]
   log_media: true
   media_max_items: 4
   media_log_interval: 200
@@ -170,13 +173,11 @@ algorithm:
     _target_: hydra.utils.get_class
     path: unirl.models.sd3.conditions.SD3Conditions
   params: ${sampling}
-  # ODE mode (paper's headline MOPD config): plain mean-matching 0.5*delta^2.
-  # true would normalize by the SDE transition std — only for noised rollouts
-  # (a real eta > 0), never with the vanishing eta below.
+  # x0 + detached MAE self-normalize (xt KL recipe keeps add_kl_coefficient=false
+  # with the same vanishing eta; v/x0 forbid add_kl_coefficient=true).
   add_kl_coefficient: false
-  # loss_target: xt (default, transition-mean KL). v / x0 match velocity or
-  # x0=x_t-σv via predict_noise_at_step; self_normalize divides by detached MAE.
-  # See sd3_opd_multi_teacher_x0_norm.yaml for the x0+normalize variant.
+  loss_target: x0
+  self_normalize: true
   # name = frozen adapter name = data-source domain tag. Per-teacher CFG scale
   # matches the scale each teacher was trained at (paper: GenEval uses 1.0).
   teachers:

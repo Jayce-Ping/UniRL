@@ -19,6 +19,8 @@ from unirl.algorithms.base import (
 from unirl.train.lora import adapter_active, adapter_names
 
 DOMAIN_KEY = "domain"
+_LOSS_TARGETS = ("xt", "v", "x0")
+_SELF_NORMALIZE_EPS = 1e-8
 
 
 @dataclass
@@ -27,6 +29,76 @@ class TeacherSpec:
 
     name: str
     guidance_scale: Optional[float] = None
+
+
+def _project_velocity_target(
+    *,
+    loss_target: str,
+    latents: torch.Tensor,
+    sigmas: torch.Tensor,
+    velocity: torch.Tensor,
+) -> torch.Tensor:
+    """Project stacked ``(x_t, v)`` into the ``v`` or ``x0`` distillation space."""
+    if loss_target == "v":
+        return velocity
+    if loss_target != "x0":
+        raise ValueError(
+            f"DiffusionOPD velocity projection expects loss_target 'v' or 'x0', got {loss_target!r}."
+        )
+    if velocity.shape != latents.shape:
+        raise ValueError(
+            "DiffusionOPD x0 projection requires matching latents and velocity shapes, "
+            f"got latents={tuple(latents.shape)} and velocity={tuple(velocity.shape)}."
+        )
+    if sigmas.ndim != 1 or int(sigmas.shape[0]) != int(latents.shape[1]):
+        raise ValueError(
+            "DiffusionOPD x0 projection expects sigmas shape [S'] matching latents dim-1, "
+            f"got sigmas={tuple(sigmas.shape)} and latents={tuple(latents.shape)}."
+        )
+    sigma = sigmas.to(device=latents.device, dtype=torch.float32).view(
+        1, latents.shape[1], *([1] * (latents.ndim - 2))
+    )
+    return latents.float() - sigma * velocity.float()
+
+
+def _align_velocity_to_sample(velocity: torch.Tensor, sample: torch.Tensor, *, step_idx: int) -> torch.Tensor:
+    """Match ``predict_noise_at_step`` output to ``latents_at`` (Bagel may drop a leading 1)."""
+    if velocity.shape == sample.shape:
+        return velocity
+    if velocity.ndim == sample.ndim - 1 and sample.shape[0] == 1 and velocity.shape == sample.shape[1:]:
+        return velocity.unsqueeze(0)
+    raise ValueError(
+        f"DiffusionOPD: predict_noise_at_step at step_idx={step_idx} returned {tuple(velocity.shape)}, "
+        f"expected {tuple(sample.shape)} to match latents_at({step_idx})."
+    )
+
+
+def _reduce_distill_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    kl_sigma: Optional[torch.Tensor],
+    self_normalize: bool,
+) -> torch.Tensor:
+    """Mean over spatial dims then (B, S'). ``kl_sigma`` set ⇒ Gaussian KL; else plain MSE."""
+    if student.shape != teacher.shape:
+        raise ValueError(
+            "DiffusionOPD loss requires matching student/teacher target shapes, "
+            f"got student={tuple(student.shape)} and teacher={tuple(teacher.shape)}."
+        )
+    student_f32 = student.float()
+    teacher_f32 = teacher.float()
+    error = student_f32 - teacher_f32
+    if kl_sigma is None:
+        per_elem = error**2
+    else:
+        per_elem = _gaussian_kl_div(student_f32, teacher_f32, kl_sigma)
+    spatial = tuple(range(2, per_elem.ndim))
+    per_sample_step = per_elem.mean(dim=spatial) if spatial else per_elem
+    if self_normalize:
+        mae = error.abs().mean(dim=spatial).detach() if spatial else error.abs().detach()
+        per_sample_step = per_sample_step / (mae + _SELF_NORMALIZE_EPS)
+    return per_sample_step.mean()
 
 
 class DiffusionOPD(StageAlgorithm):
@@ -51,6 +123,8 @@ class DiffusionOPD(StageAlgorithm):
         conditions_cls: Optional[Type[Any]] = None,
         teachers: Any = None,
         add_kl_coefficient: bool = False,
+        loss_target: str = "xt",
+        self_normalize: bool = False,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is not None:
@@ -61,11 +135,36 @@ class DiffusionOPD(StageAlgorithm):
         self.params = params
         self.conditions_cls = conditions_cls
         self.add_kl_coefficient = bool(add_kl_coefficient)
+        if not isinstance(loss_target, str):
+            raise TypeError(
+                f"DiffusionOPD: expected str for loss_target, got {type(loss_target).__name__}: {loss_target!r}"
+            )
+        if loss_target not in _LOSS_TARGETS:
+            raise ValueError(
+                f"DiffusionOPD: loss_target must be one of {_LOSS_TARGETS}, got {loss_target!r}."
+            )
+        if not isinstance(self_normalize, bool):
+            raise TypeError(
+                "DiffusionOPD: expected bool for self_normalize, "
+                f"got {type(self_normalize).__name__}: {self_normalize!r}"
+            )
+        self.loss_target = loss_target
+        self.self_normalize = self_normalize
         if self.add_kl_coefficient and not float(getattr(params, "eta", 0.0)) > 0.0:
             raise ValueError(
                 "DiffusionOPD: add_kl_coefficient=True normalizes by the SDE transition std, "
                 f"which scales with sampling eta; got eta={getattr(params, 'eta', None)!r}. "
                 "Use a noised rollout (eta > 0), or add_kl_coefficient=False for ODE mean-matching."
+            )
+        if self.loss_target in ("v", "x0") and self.add_kl_coefficient:
+            raise ValueError(
+                "DiffusionOPD: add_kl_coefficient=True is only defined for loss_target='xt' "
+                f"(Gaussian KL on transition means); got loss_target={self.loss_target!r}."
+            )
+        if self.loss_target in ("v", "x0") and not callable(getattr(stage, "predict_noise_at_step", None)):
+            raise TypeError(
+                f"DiffusionOPD: loss_target={self.loss_target!r} needs stage.predict_noise_at_step; "
+                f"{type(stage).__name__} does not provide it."
             )
 
         self.teachers: Dict[str, TeacherSpec] = {}
@@ -114,12 +213,8 @@ class DiffusionOPD(StageAlgorithm):
             return []
         return [int(i) for i in segment.sde_indices.tolist()]
 
-    def prepare_part(self, part: Any) -> Any:
-        """Freeze the batch's teacher transition means on ``segment.sde_means``."""
-        target_steps = self._resolve_target_steps(part.segment)
-        if not target_steps:
-            return part
-
+    def _resolve_teacher(self, part: Any) -> TeacherSpec:
+        """Single-domain teacher for this train Part."""
         domains = {(md or {}).get(DOMAIN_KEY) for md in (part.metadata or [None] * part.batch_size)}
         if domains == {None}:
             raise RuntimeError(
@@ -139,26 +234,74 @@ class DiffusionOPD(StageAlgorithm):
                 f"DiffusionOPD.prepare_part: batch domain {domain!r} has no configured teacher "
                 f"(teachers: {sorted(self.teachers)})."
             )
+        return teacher
 
-        teacher_params = self.params
-        if teacher.guidance_scale is not None:
-            teacher_params = dataclasses.replace(self.params, guidance_scale=teacher.guidance_scale)
+    def _teacher_params(self, teacher: TeacherSpec) -> Any:
+        if teacher.guidance_scale is None:
+            return self.params
+        return dataclasses.replace(self.params, guidance_scale=teacher.guidance_scale)
 
-        typed_conds = typed_conditions(part.conditions, self.conditions_cls)
-        with torch.no_grad(), adapter_active(self._model, teacher.name):
-            result = self.stage.replay(
-                typed_conds,
-                segment=part.segment,
-                params=teacher_params,
-                step_indices=target_steps,
-            )
+    def _replay_means(self, conditions: Any, segment: Any, params: Any, target_steps: List[int]) -> torch.Tensor:
+        result = self.stage.replay(
+            conditions,
+            segment=segment,
+            params=params,
+            step_indices=target_steps,
+        )
         if result.prev_sample_means is None:
             raise RuntimeError(
-                "DiffusionOPD.prepare_part: stage.replay() returned prev_sample_means=None; "
-                "the distillation target requires the stage's replay to produce means."
+                "DiffusionOPD: stage.replay() returned prev_sample_means=None; "
+                "loss_target='xt' requires the stage's replay to produce means."
             )
-        part.segment.sde_means = result.prev_sample_means.detach().cpu()
-        self._active_teacher = domain
+        return result.prev_sample_means
+
+    def _velocity_targets(self, conditions: Any, segment: Any, params: Any, target_steps: List[int]) -> torch.Tensor:
+        """Per-step ``predict_noise_at_step`` stacked to ``[B, S', *latent]``, then projected."""
+        if segment.sigmas is None:
+            raise RuntimeError(
+                f"DiffusionOPD: segment.sigmas is None (needed for loss_target={self.loss_target!r})."
+            )
+        velocities: List[torch.Tensor] = []
+        latents: List[torch.Tensor] = []
+        sigmas: List[torch.Tensor] = []
+        for step_idx in target_steps:
+            sample = segment.latents_at(step_idx)
+            sigma = segment.sigmas[int(step_idx)]
+            velocity = self.stage.predict_noise_at_step(
+                conditions, sample=sample, sigma=sigma, params=params
+            )
+            velocity = _align_velocity_to_sample(velocity, sample, step_idx=step_idx)
+            velocities.append(velocity)
+            latents.append(sample.to(device=velocity.device))
+            sigmas.append(torch.as_tensor(sigma, device=velocity.device, dtype=torch.float32).reshape(()))
+        return _project_velocity_target(
+            loss_target=self.loss_target,
+            latents=torch.stack(latents, dim=1),
+            sigmas=torch.stack(sigmas, dim=0),
+            velocity=torch.stack(velocities, dim=1),
+        )
+
+    def _student_target(self, conditions: Any, segment: Any, target_steps: List[int]) -> torch.Tensor:
+        if self.loss_target == "xt":
+            return self._replay_means(conditions, segment, self.params, target_steps)
+        return self._velocity_targets(conditions, segment, self.params, target_steps)
+
+    def prepare_part(self, part: Any) -> Any:
+        """Freeze the batch's teacher target on ``segment.sde_means`` (μ / v / x0)."""
+        target_steps = self._resolve_target_steps(part.segment)
+        if not target_steps:
+            return part
+
+        teacher = self._resolve_teacher(part)
+        teacher_params = self._teacher_params(teacher)
+        typed_conds = typed_conditions(part.conditions, self.conditions_cls)
+        with torch.no_grad(), adapter_active(self._model, teacher.name):
+            if self.loss_target == "xt":
+                target = self._replay_means(typed_conds, part.segment, teacher_params, target_steps)
+            else:
+                target = self._velocity_targets(typed_conds, part.segment, teacher_params, target_steps)
+        part.segment.sde_means = target.detach().cpu()
+        self._active_teacher = teacher.name
         return part
 
     def compute_loss_and_backward(
@@ -170,41 +313,32 @@ class DiffusionOPD(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        """Per-step Gaussian KL between student and frozen teacher means."""
+        """Per-step student vs frozen teacher target (KL on ``xt``, MSE on ``v``/``x0``)."""
         target_steps = self._resolve_target_steps(segment)
         if not target_steps or segment.sde_means is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay_result = self.stage.replay(
-            typed_conds,
-            segment=segment,
-            params=self.params,
-            step_indices=target_steps,
-        )
-        student_means = replay_result.prev_sample_means  # [B, S', *latent]
-        if student_means is None:
-            raise RuntimeError(
-                "DiffusionOPD.compute_loss_and_backward: stage.replay() returned "
-                "prev_sample_means=None for the student forward."
+        student = self._student_target(typed_conds, segment, target_steps)
+        teacher = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means")
+        teacher = teacher.to(device=student.device)
+
+        kl_sigma: Optional[torch.Tensor] = None
+        if self.loss_target == "xt":
+            kl_sigma = _transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=target_steps,
+                eta=float(getattr(self.params, "eta", 1.0)),
+                device=student.device,
+                add_coefficient=self.add_kl_coefficient,
             )
-
-        teacher_means = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means")
-        # fp32 before squaring: bf16 loses the shrinking teacher-student delta.
-        student_f32 = student_means.float()
-        teacher_f32 = teacher_means.to(device=student_means.device, dtype=torch.float32)
-
-        sigma_t = _transition_sigma(
-            self.stage,
-            segment=segment,
-            target_steps=target_steps,
-            eta=float(getattr(self.params, "eta", 1.0)),
-            device=student_means.device,
-            add_coefficient=self.add_kl_coefficient,
+        loss = _reduce_distill_loss(
+            student,
+            teacher,
+            kl_sigma=kl_sigma,
+            self_normalize=self.self_normalize,
         )
-        kl_per_elem = _gaussian_kl_div(student_f32, teacher_f32, sigma_t)
-        kl_per_sample_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']
-        loss = kl_per_sample_step.mean()
 
         (loss * loss_scale).backward()
 

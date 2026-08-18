@@ -47,10 +47,12 @@ not just three-tensor arithmetic.
   PPO-clipped ratio (`flowgrpo.py` / `grpo.py`); FlowDPPO masks `-A·r` by a
   Gaussian-KL-vs-advantage criterion (`flowdppo.py`); DiffusionNFT is a dual-adapter
   reconstruction MSE (`diffusionnft.py`); DRPO is a token-adaptive SPO quadratic (`drpo.py`);
-  DiffusionOPD is the teacher-anchored family — a per-step Gaussian KL against frozen
-  teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
-  it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
-  (`diffusionopd.py`).
+  DiffusionOPD is the teacher-anchored family — distillation against frozen teacher
+  LoRA adapters (backend-owned `frozen_adapters`), not RL: it ignores advantages and
+  picks its teacher from the batch's `metadata["domain"]`. Default `loss_target='xt'`
+  is a per-step Gaussian KL on transition means; `v` / `x0` match velocity or
+  `x0 = x_t - σ v` via `predict_noise_at_step`. Optional `self_normalize` divides
+  each sample-step by detached MAE (`diffusionopd.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -88,6 +90,8 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
+  `add_kl_coefficient` is `xt`-only; `v`/`x0` raise if it is set. `x0` uses `segment.sigmas`
+  (flow σ in [0, 1]), not scheduler-timestep/1000.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
